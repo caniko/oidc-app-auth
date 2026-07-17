@@ -19,10 +19,9 @@ The initial consumers are Foundry Circle and Pink Raven. Keep the crate
 provider-neutral so both applications share the security-sensitive protocol
 code without sharing their route or persistence models.
 
-The consumers currently use a local `path` dependency with an explicit version
-so this workspace can validate the integration before publication. A release
-must publish/tag `oidc-app-auth` first, then replace those local paths with the
-reviewed immutable dependency pin.
+The consumers currently use an immutable git dependency pinned to a reviewed
+commit because the first crates.io publication is still pending. After release,
+replace that pin with the crates.io dependency shown below.
 
 ## Integration
 
