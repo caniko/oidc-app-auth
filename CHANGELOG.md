@@ -10,3 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Provider-neutral OIDC PKCE and opaque browser-session primitives.
+
+### Changed
+
+- Added crates.io metadata, dual-license texts, docs.rs configuration, and
+  release validation documentation.

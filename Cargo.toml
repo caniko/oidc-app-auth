@@ -7,15 +7,36 @@ license = "MIT OR Apache-2.0"
 description = "Provider-neutral OIDC PKCE and opaque browser-session primitives"
 readme = "README.md"
 repository = "https://codeberg.org/caniko/oidc-app-auth"
-exclude = ["graphify-out/**"]
+documentation = "https://docs.rs/oidc-app-auth"
+keywords = ["oidc", "oauth2", "pkce", "authentication", "web"]
+categories = ["authentication", "web-programming"]
+include = [
+  "/Cargo.lock",
+  "/Cargo.toml",
+  "/CHANGELOG.md",
+  "/LICENSE",
+  "/LICENSE-APACHE",
+  "/LICENSE-MIT",
+  "/README.md",
+  "/src/**/*.rs",
+]
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 base64 = "0.22"
 hex = "0.4"
 hmac = "0.12"
-openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
+openidconnect = { version = "4", default-features = false, features = [
+  "reqwest",
+  "rustls-tls",
+] }
 rand = "0.8"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "rustls",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -37,69 +37,109 @@ const DEFAULT_FLOW_TTL: Duration = Duration::from_secs(600);
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AuthError {
+    /// The local OIDC configuration is incomplete or malformed.
     #[error("invalid OIDC configuration: {0}")]
     Configuration(String),
+    /// Provider metadata discovery failed.
     #[error("OIDC discovery failed: {0}")]
     Discovery(String),
+    /// The callback was missing required values or failed state validation.
     #[error("OIDC authorization response is invalid: {0}")]
     Callback(String),
+    /// The authorization code could not be exchanged for tokens.
     #[error("OIDC token exchange failed: {0}")]
     Exchange(String),
+    /// The provider returned an identity that could not be verified or used.
     #[error("OIDC identity is not usable: {0}")]
     Identity(String),
+    /// The signed flow state could not be encoded or authenticated.
     #[error("invalid login transaction")]
     InvalidTransaction,
+    /// The login transaction is older than the bounded flow lifetime.
     #[error("login transaction expired")]
     ExpiredTransaction,
 }
 
+/// Public OIDC client settings for a browser authorization-code flow.
+///
+/// This crate intentionally models a public client: no client secret is
+/// accepted or stored. Applications should keep any provider-specific secret
+/// handling outside this type.
 #[derive(Clone, Debug)]
 pub struct OidcConfig {
+    /// The issuer URL used for bounded provider metadata discovery.
     pub issuer: String,
+    /// The public OAuth/OIDC client identifier.
     pub client_id: String,
+    /// The callback URL registered for this client.
     pub redirect_uri: String,
+    /// Scopes requested during authorization.
     pub scopes: Vec<String>,
 }
 
+/// State retained between authorization and callback handling.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LoginTransaction {
+    /// The PKCE verifier paired with the authorization request.
     pub pkce_verifier: String,
+    /// The CSRF state value returned by the provider.
     pub csrf_state: String,
+    /// The nonce used to validate the ID token.
     pub nonce: String,
+    /// Unix timestamp at which the transaction was issued.
     pub issued_at: u64,
+    /// An optional same-origin path to use after successful login.
     pub return_to: Option<String>,
 }
 
 impl LoginTransaction {
+    /// Returns whether the transaction is before `now` or outside its bounded
+    /// ten-minute lifetime.
     pub fn is_expired_at(&self, now: u64) -> bool {
         now < self.issued_at || now.saturating_sub(self.issued_at) > DEFAULT_FLOW_TTL.as_secs()
     }
 }
 
+/// Values received from an OIDC authorization callback.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Callback {
+    /// The authorization code, when the provider completed the request.
     pub code: Option<String>,
+    /// The CSRF state returned by the provider.
     pub state: Option<String>,
+    /// A provider-reported OAuth error, when authorization failed.
     pub error: Option<String>,
+    /// An optional human-readable description of `error`.
     pub error_description: Option<String>,
 }
 
+/// Verified identity claims returned by [`OidcClient::complete`].
 #[derive(Clone, Debug, Serialize)]
 pub struct VerifiedIdentity {
+    /// The issuer that authenticated the subject.
     pub issuer: String,
+    /// The provider-stable subject identifier.
     pub subject: String,
+    /// A normalized lower-case email address, when supplied by the provider.
     pub email: Option<String>,
+    /// A display name, when supplied by the provider.
     pub display_name: Option<String>,
+    /// Group claims supplied by the provider.
     pub groups: BTreeSet<String>,
+    /// The ID token expiry as a Unix timestamp, when available.
     pub expires_at: Option<u64>,
 }
 
+/// The authorization URL and state that must be retained for its callback.
 #[derive(Clone, Debug)]
 pub struct AuthorizationRequest {
+    /// The provider authorization URL.
     pub url: String,
+    /// The state needed to validate and complete the callback.
     pub transaction: LoginTransaction,
 }
 
+/// A discovered OIDC provider client using public-client PKCE.
 pub struct OidcClient {
     metadata: CoreProviderMetadata,
     http: oidc_reqwest::Client,
@@ -107,6 +147,10 @@ pub struct OidcClient {
 }
 
 impl OidcClient {
+    /// Discover provider metadata and construct a bounded HTTP client.
+    ///
+    /// Returns [`AuthError::Configuration`] for invalid local settings and
+    /// [`AuthError::Discovery`] when the issuer cannot be discovered.
     pub async fn discover(config: OidcConfig) -> Result<Self, AuthError> {
         if config.issuer.trim().is_empty() {
             return Err(AuthError::Configuration("issuer is empty".into()));
@@ -147,6 +191,11 @@ impl OidcClient {
         .set_redirect_uri(redirect))
     }
 
+    /// Build an authorization URL and fresh S256 PKCE transaction.
+    ///
+    /// The returned transaction must be retained until [`Self::complete`] is
+    /// called. `return_to` is carried as application state and should be
+    /// passed through [`sanitize_return_to`] before it is supplied here.
     pub fn authorization_request(
         &self,
         return_to: Option<String>,
@@ -174,6 +223,14 @@ impl OidcClient {
         })
     }
 
+    /// Validate a callback, exchange its code with PKCE, and return verified
+    /// identity claims.
+    ///
+    /// The transaction is single-use from the caller's perspective: callers
+    /// should remove it from their session store after attempting completion.
+    /// Errors cover expiry, callback/state mismatches, exchange failures, and
+    /// invalid identity claims. This method does not panic for provider or
+    /// network failures.
     pub async fn complete(
         &self,
         callback: Callback,
@@ -254,9 +311,11 @@ struct AdditionalClaims {
 impl openidconnect::AdditionalClaims for AdditionalClaims {}
 
 #[derive(Clone, PartialEq, Eq)]
+/// An opaque, randomly generated browser-session token.
 pub struct SessionToken(String);
 
 impl SessionToken {
+    /// Generate a new 256-bit token encoded without padding.
     #[must_use]
     pub fn generate() -> Self {
         let mut bytes = [0_u8; 32];
@@ -264,15 +323,18 @@ impl SessionToken {
         Self(URL_SAFE_NO_PAD.encode(bytes))
     }
 
+    /// Return the opaque token for setting a browser cookie or persisting it.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// Hash the token for persistence without storing the bearer value.
     #[must_use]
     pub fn hash(&self) -> String {
         Self::hash_value(&self.0)
     }
 
+    /// Hash an arbitrary token value with SHA-256.
     #[must_use]
     pub fn hash_value(value: &str) -> String {
         hex::encode(Sha256::digest(value.as_bytes()))
@@ -286,9 +348,15 @@ impl std::fmt::Debug for SessionToken {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+/// A signed, short-lived representation of login state suitable for a cookie.
 pub struct SignedFlowState(LoginTransaction);
 
 impl SignedFlowState {
+    /// Serialize and authenticate a transaction with an application secret.
+    ///
+    /// The returned value is opaque to the browser. A sufficiently random
+    /// secret is required; callers must still enforce cookie policy and
+    /// single-use semantics.
     pub fn seal(secret: &[u8], transaction: LoginTransaction) -> Result<String, AuthError> {
         let payload = URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&transaction).map_err(|_| AuthError::InvalidTransaction)?);
@@ -301,6 +369,7 @@ impl SignedFlowState {
         ))
     }
 
+    /// Verify and decode a cookie, returning `None` for tampering or expiry.
     pub fn open(secret: &[u8], cookie: &str) -> Option<LoginTransaction> {
         let (payload, mac_hex) = cookie.split_once('.')?;
         let provided = hex::decode(mac_hex).ok()?;
@@ -313,6 +382,7 @@ impl SignedFlowState {
     }
 }
 
+/// Keep only same-origin absolute paths for post-login redirects.
 pub fn sanitize_return_to(value: Option<&str>) -> Option<String> {
     let value = value?.trim();
     if value.starts_with('/')
@@ -326,6 +396,7 @@ pub fn sanitize_return_to(value: Option<&str>) -> Option<String> {
     }
 }
 
+/// Return the current Unix timestamp in seconds, saturating before the epoch.
 pub fn unix_time_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

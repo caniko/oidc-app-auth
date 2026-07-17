@@ -23,3 +23,35 @@ The consumers currently use a local `path` dependency with an explicit version
 so this workspace can validate the integration before publication. A release
 must publish/tag `oidc-app-auth` first, then replace those local paths with the
 reviewed immutable dependency pin.
+
+## Integration
+
+After the first crates.io release, add the crate to an application with:
+
+```toml
+oidc-app-auth = "0.1"
+```
+
+The main entry points are `OidcClient::discover` for provider metadata,
+`OidcClient::authorization_request` and `OidcClient::complete` for the
+authorization-code flow, `SignedFlowState` for short-lived signed browser
+state, and `SessionToken` for opaque session identifiers. Applications remain
+responsible for persistence, cookies, access policy, and secret storage.
+
+The generated API documentation is published at
+[docs.rs/oidc-app-auth](https://docs.rs/oidc-app-auth).
+
+## Release validation
+
+The repository's Forgejo workflows run the release checks and publish the
+crate. The local equivalents are:
+
+```bash
+nix flake check --no-build --no-update-lock-file
+nix develop -c cargo fmt --all -- --check
+nix develop -c cargo clippy --locked --all-targets --all-features -- --deny warnings
+nix develop -c cargo test --locked --all-features
+nix develop -c cargo doc --locked --no-deps --all-features
+nix develop -c cargo audit
+nix develop -c cargo package --locked --list
+```
