@@ -1,0 +1,24 @@
+[ci]
+runtime = "nix"
+runner = "atlas-nix-trusted"
+with_msrv = true
+with_audit = true
+with_docs = true
+publish_crates = true
+step_runners = { cargo-clippy = "codeberg-small", cargo-doc = "codeberg-small", cargo-fmt = "codeberg-tiny", cargo-package = "codeberg-medium", cargo-test = "codeberg-medium", nix-check = "atlas-nix-trusted", quality-tools = "codeberg-small" }
+
+[release.signing]
+key = "818D507F1E62139F8A17EAA64623DEA06FDACFE1"
+
+[release.codeberg]
+repo = "caniko/oidc-app-auth"
+
+[release.artifacts]
+runner = "atlas-nix-trusted"
+build_commands = [
+  "mkdir -p release",
+  "rm -f release/oidc-app-auth-*.crate",
+  "nix develop -c cargo package --locked",
+  "cp target/package/oidc-app-auth-*.crate release/",
+]
+sign = false

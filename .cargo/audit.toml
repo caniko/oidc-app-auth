@@ -1,0 +1,8 @@
+[advisories]
+# RUSTSEC-2023-0071 (Marvin timing side channel) is pulled in by
+# openidconnect 4.0.1 through rsa 0.9.10. RustSec reports no fixed upgrade.
+# This crate uses openidconnect for OIDC client verification and does not
+# perform RSA private-key operations, so the key-recovery attack is not
+# reachable here. Remove this exception when openidconnect can use a fixed
+# rsa release.
+ignore = ["RUSTSEC-2023-0071"]
