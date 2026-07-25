@@ -6,6 +6,8 @@ with_audit = true
 with_docs = true
 publish_crates = true
 step_runners = { cargo-clippy = "codeberg-small", cargo-doc = "codeberg-small", cargo-fmt = "codeberg-tiny", cargo-package = "codeberg-medium", cargo-test = "codeberg-medium", nix-check = "atlas-nix-trusted", quality-tools = "codeberg-small" }
+provider = "actions"
+platform = "forgejo"
 
 [release.signing]
 key = "818D507F1E62139F8A17EAA64623DEA06FDACFE1"
