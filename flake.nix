@@ -46,8 +46,9 @@
         strictDeps = true;
       };
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+      uncachedPackage = craneLib.buildPackage (commonArgs // {inherit cargoArtifacts;});
       package = buildCache.withRustCache {
-        package = craneLib.buildPackage (commonArgs // {inherit cargoArtifacts;});
+        package = uncachedPackage;
       };
       treefmtEval = treefmt-nix.lib.evalModule pkgs (import ./nix/treefmt.nix);
       pre-commit-check = git-hooks.lib.${system}.run {
@@ -60,9 +61,11 @@
       };
     in {
       packages.default = package;
+      packages.uncached = uncachedPackage;
       formatter = treefmtEval.config.build.wrapper;
       checks = {
-        default = package;
+        # CI validates the same package without depending on a host cache mount.
+        default = uncachedPackage;
         formatting = treefmtEval.config.build.check self;
         clippy = craneLib.cargoClippy (commonArgs
           // {
