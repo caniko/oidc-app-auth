@@ -42,7 +42,7 @@ The generated API documentation is published at
 
 ## Release validation
 
-The repository's Forgejo workflows run the release checks and publish the
+The repository's GitHub Actions workflows run the release checks and publish the
 crate. The local equivalents are:
 
 ```bash
