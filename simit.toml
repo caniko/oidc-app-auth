@@ -1,4 +1,5 @@
 [ci]
+push_branches = ["main", "simit/update/**"]
 runtime = "nix"
 runner = "ubuntu-24.04"
 with_msrv = true
