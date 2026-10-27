@@ -5,14 +5,9 @@
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
-use openidconnect::{
-    AuthenticationFlow, AuthorizationCode, ClientId, CsrfToken, EndpointMaybeSet, EndpointNotSet,
-    EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier,
-    RedirectUrl, Scope, TokenResponse,
-    core::{CoreClient, CoreGenderClaim, CoreProviderMetadata, CoreResponseType},
-    reqwest as oidc_reqwest,
-};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
 use rand::{RngCore, rngs::OsRng};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -22,15 +17,6 @@ use std::{
 use thiserror::Error;
 
 type HmacSha256 = Hmac<Sha256>;
-
-type ConfiguredClient = CoreClient<
-    EndpointSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointMaybeSet,
-    EndpointMaybeSet,
->;
 
 const DEFAULT_FLOW_TTL: Duration = Duration::from_secs(600);
 
@@ -139,10 +125,59 @@ pub struct AuthorizationRequest {
     pub transaction: LoginTransaction,
 }
 
+/// The provider metadata this crate uses, from the discovery document.
+#[derive(Clone, Debug, Deserialize)]
+struct ProviderMetadata {
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    jwks_uri: String,
+    userinfo_endpoint: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    id_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Audience {
+    Many(Vec<String>),
+    One(serde::de::IgnoredAny),
+}
+
+#[derive(Debug, Deserialize)]
+struct IdClaims {
+    sub: String,
+    aud: Audience,
+    azp: Option<String>,
+    exp: u64,
+    iat: Option<u64>,
+    nonce: Option<String>,
+    at_hash: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct UserInfo {
+    sub: String,
+    email: Option<String>,
+    name: Option<String>,
+    #[serde(default)]
+    groups: Vec<String>,
+}
+
+/// Clock skew tolerated for `exp`, `nbf` and `iat`.
+const LEEWAY_SECS: u64 = 60;
+
+/// ID-token signature algorithms accepted. `none` and `HS*` are never allowed.
+const ALLOWED_ALGS: [Algorithm; 3] = [Algorithm::RS256, Algorithm::ES256, Algorithm::EdDSA];
+
 /// A discovered OIDC provider client using public-client PKCE.
 pub struct OidcClient {
-    metadata: CoreProviderMetadata,
-    http: oidc_reqwest::Client,
+    metadata: ProviderMetadata,
+    http: reqwest::Client,
     config: OidcConfig,
 }
 
@@ -161,34 +196,35 @@ impl OidcClient {
         if config.redirect_uri.trim().is_empty() {
             return Err(AuthError::Configuration("redirect_uri is empty".into()));
         }
+        Url::parse(&config.redirect_uri)
+            .map_err(|error| AuthError::Configuration(format!("redirect URI: {error}")))?;
+        Url::parse(&config.issuer)
+            .map_err(|error| AuthError::Configuration(format!("issuer URL: {error}")))?;
 
-        let http = oidc_reqwest::Client::builder()
-            .redirect(oidc_reqwest::redirect::Policy::none())
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|error| AuthError::Configuration(format!("HTTP client: {error}")))?;
-        let issuer = IssuerUrl::new(config.issuer.clone())
-            .map_err(|error| AuthError::Configuration(format!("issuer URL: {error}")))?;
-        let metadata = CoreProviderMetadata::discover_async(issuer, &http)
+        let url = format!(
+            "{}/.well-known/openid-configuration",
+            config.issuer.trim_end_matches('/')
+        );
+        let metadata: ProviderMetadata = get_json(http.get(url))
             .await
-            .map_err(|error| AuthError::Discovery(error.to_string()))?;
+            .map_err(AuthError::Discovery)?;
+        if metadata.issuer != config.issuer {
+            return Err(AuthError::Discovery(format!(
+                "issuer mismatch: expected {}, got {}",
+                config.issuer, metadata.issuer
+            )));
+        }
         Ok(Self {
             metadata,
             http,
             config,
         })
-    }
-
-    fn client(&self) -> Result<ConfiguredClient, AuthError> {
-        let redirect = RedirectUrl::new(self.config.redirect_uri.clone())
-            .map_err(|error| AuthError::Configuration(format!("redirect URI: {error}")))?;
-        Ok(CoreClient::from_provider_metadata(
-            self.metadata.clone(),
-            ClientId::new(self.config.client_id.clone()),
-            None,
-        )
-        .set_redirect_uri(redirect))
     }
 
     /// Build an authorization URL and fresh S256 PKCE transaction.
@@ -200,23 +236,38 @@ impl OidcClient {
         &self,
         return_to: Option<String>,
     ) -> Result<AuthorizationRequest, AuthError> {
-        let client = self.client()?;
-        let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-        let mut request = client.authorize_url(
-            AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
-            CsrfToken::new_random,
-            Nonce::new_random,
+        let mut url = Url::parse(&self.metadata.authorization_endpoint).map_err(|error| {
+            AuthError::Configuration(format!("authorization endpoint: {error}"))
+        })?;
+        let verifier = random_token();
+        let csrf_state = random_token();
+        let nonce = random_token();
+        let mut scopes = vec!["openid"];
+        scopes.extend(
+            self.config
+                .scopes
+                .iter()
+                .map(String::as_str)
+                .filter(|scope| *scope != "openid"),
         );
-        for scope in &self.config.scopes {
-            request = request.add_scope(Scope::new(scope.clone()));
-        }
-        let (url, csrf, nonce) = request.set_pkce_challenge(challenge).url();
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &self.config.client_id)
+            .append_pair("redirect_uri", &self.config.redirect_uri)
+            .append_pair("scope", &scopes.join(" "))
+            .append_pair("state", &csrf_state)
+            .append_pair("nonce", &nonce)
+            .append_pair(
+                "code_challenge",
+                &URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
+            )
+            .append_pair("code_challenge_method", "S256");
         Ok(AuthorizationRequest {
             url: url.to_string(),
             transaction: LoginTransaction {
-                pkce_verifier: verifier.secret().clone(),
-                csrf_state: csrf.secret().clone(),
-                nonce: nonce.secret().clone(),
+                pkce_verifier: verifier,
+                csrf_state,
+                nonce,
                 issued_at: unix_time_seconds(),
                 return_to,
             },
@@ -254,61 +305,133 @@ impl OidcClient {
         if state != transaction.csrf_state {
             return Err(AuthError::Callback("state mismatch".into()));
         }
-        let client = self.client()?;
-        let exchange = client
-            .exchange_code(AuthorizationCode::new(code))
-            .map_err(|error| AuthError::Exchange(error.to_string()))?
-            .set_pkce_verifier(PkceCodeVerifier::new(transaction.pkce_verifier));
-        let tokens = exchange
-            .request_async(&self.http)
+        let tokens: TokenResponse =
+            get_json(self.http.post(&self.metadata.token_endpoint).form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("redirect_uri", self.config.redirect_uri.as_str()),
+                ("client_id", self.config.client_id.as_str()),
+                ("code_verifier", transaction.pkce_verifier.as_str()),
+            ]))
             .await
-            .map_err(|error| AuthError::Exchange(error.to_string()))?;
+            .map_err(AuthError::Exchange)?;
         let id_token = tokens
-            .id_token()
+            .id_token
             .ok_or_else(|| AuthError::Identity("provider returned no ID token".into()))?;
-        let claims = id_token
-            .claims(&client.id_token_verifier(), &Nonce::new(transaction.nonce))
-            .map_err(|error| AuthError::Identity(format!("ID token validation: {error}")))?;
-        let subject = claims.subject().as_str().to_owned();
-        let userinfo = client
-            .user_info(
-                tokens.access_token().clone(),
-                Some(claims.subject().clone()),
-            )
-            .map_err(|error| AuthError::Identity(format!("userinfo endpoint: {error}")))?
-            .request_async::<AdditionalClaims, _, CoreGenderClaim>(&self.http)
+        let jwks: JwkSet = get_json(self.http.get(&self.metadata.jwks_uri))
             .await
-            .map_err(|error| AuthError::Identity(format!("userinfo validation: {error}")))?;
-        let groups = userinfo
-            .additional_claims()
-            .groups
-            .iter()
-            .cloned()
-            .collect();
+            .map_err(|error| AuthError::Identity(format!("JWKS: {error}")))?;
+        let claims = verify_id_token(
+            &id_token,
+            &jwks,
+            &self.config.issuer,
+            &self.config.client_id,
+            &transaction.nonce,
+            &tokens.access_token,
+        )
+        .map_err(|error| AuthError::Identity(format!("ID token validation: {error}")))?;
+
+        let endpoint = self
+            .metadata
+            .userinfo_endpoint
+            .as_ref()
+            .ok_or_else(|| AuthError::Identity("userinfo endpoint: not advertised".into()))?;
+        let userinfo: UserInfo =
+            get_json(self.http.get(endpoint).bearer_auth(&tokens.access_token))
+                .await
+                .map_err(|error| AuthError::Identity(format!("userinfo validation: {error}")))?;
+        if userinfo.sub != claims.sub {
+            return Err(AuthError::Identity(
+                "userinfo validation: subject mismatch".into(),
+            ));
+        }
         Ok(VerifiedIdentity {
             issuer: self.config.issuer.clone(),
-            subject,
-            email: userinfo
-                .email()
-                .map(|email| email.as_str().to_ascii_lowercase()),
-            display_name: userinfo.name().and_then(|name| {
-                serde_json::to_value(name.get(None)?)
-                    .ok()?
-                    .as_str()
-                    .map(str::to_owned)
-            }),
-            groups,
-            expires_at: Some(claims.expiration().timestamp().max(0) as u64),
+            subject: claims.sub,
+            email: userinfo.email.map(|email| email.to_ascii_lowercase()),
+            display_name: userinfo.name,
+            groups: userinfo.groups.into_iter().collect(),
+            expires_at: Some(claims.exp),
         })
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct AdditionalClaims {
-    #[serde(default)]
-    groups: Vec<String>,
+/// Send a request and parse a successful JSON response.
+async fn get_json<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+) -> Result<T, String> {
+    let response = request.send().await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+    response.json().await.map_err(|error| error.to_string())
 }
-impl openidconnect::AdditionalClaims for AdditionalClaims {}
+
+/// 256 random bits, base64url-encoded: PKCE verifier, state and nonce.
+fn random_token() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Verify an ID token's signature (against `jwks`, selected by `kid`) and
+/// claims: allowed algorithm, `iss`, `aud`, `azp`, `exp`, `nbf`, `iat`,
+/// `nonce`, and `at_hash` when present.
+fn verify_id_token(
+    token: &str,
+    jwks: &JwkSet,
+    issuer: &str,
+    client_id: &str,
+    nonce: &str,
+    access_token: &str,
+) -> Result<IdClaims, String> {
+    let header = jsonwebtoken::decode_header(token).map_err(|error| error.to_string())?;
+    if !ALLOWED_ALGS.contains(&header.alg) {
+        return Err(format!("algorithm {:?} not allowed", header.alg));
+    }
+    let jwk = match (&header.kid, jwks.keys.as_slice()) {
+        (Some(kid), _) => jwks.find(kid),
+        (None, [only]) => Some(only),
+        _ => None,
+    }
+    .ok_or("no matching signing key")?;
+    let key = DecodingKey::from_jwk(jwk).map_err(|error| error.to_string())?;
+    let mut validation = Validation::new(header.alg);
+    validation.leeway = LEEWAY_SECS;
+    validation.validate_nbf = true;
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(&[client_id]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+    let claims = jsonwebtoken::decode::<IdClaims>(token, &key, &validation)
+        .map_err(|error| error.to_string())?
+        .claims;
+
+    if claims.nonce.as_deref() != Some(nonce) {
+        return Err("nonce mismatch".into());
+    }
+    let multiple = matches!(&claims.aud, Audience::Many(audiences) if audiences.len() > 1);
+    match claims.azp.as_deref() {
+        Some(azp) if azp != client_id => return Err("azp mismatch".into()),
+        None if multiple => return Err("azp missing for multiple audiences".into()),
+        _ => {}
+    }
+    if claims
+        .iat
+        .is_some_and(|iat| iat > unix_time_seconds() + LEEWAY_SECS)
+    {
+        return Err("iat is in the future".into());
+    }
+    // at_hash: left half of the SHA-256 of the access token (all allowed
+    // algorithms use a 256-bit hash).
+    if let Some(at_hash) = &claims.at_hash {
+        let digest = Sha256::digest(access_token.as_bytes());
+        if *at_hash != URL_SAFE_NO_PAD.encode(&digest[..16]) {
+            return Err("at_hash mismatch".into());
+        }
+    }
+    Ok(claims)
+}
 
 #[derive(Clone, PartialEq, Eq)]
 /// An opaque, randomly generated browser-session token.
@@ -455,5 +578,155 @@ mod tests {
         let mut flow = transaction();
         flow.issued_at = unix_time_seconds() + 1;
         assert!(flow.is_expired_at(unix_time_seconds()));
+    }
+
+    // Test-only RSA key (generated for this fixture; protects nothing).
+    const TEST_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
+MIIEogIBAAKCAQEAvMMoYHJ6xbjxFgYUc986J2j+z3gLpGykggyx1Vj8T83SolqL
+U8iAXslPl5lorHTi3JAY7k3No5XGsiBT8Tayv7VeMxEcFtjJ3qIPdsebgq0V85MZ
+XfM1o59MXl9CTBBkcGCY6hPXKTsgSdGsBTQds/ZXUtNZv5UM/2wGiNSDJRD4dRd3
+Ukg/PRRbtVMLl6lotcuUFVBb9JYUHbPP6pQO/266VoQsM9Vg0yfaL6QkzortJVfk
+3AaaV35/LrG+RZAkTMeNJ6iYqWQEguDlXqb94zefkf9y1hEz0XtxezXftGynRhZH
+YcPlUQU6MlET0zEcvPu4jZHsWW10bge5cPNXTwIDAQABAoIBAAu+gq0Zgkz5+Dn8
+D9qzuU0Jac0jtWm5/rQ+sPPKsQwQDLpgMsn4MBB1qveOKmaMcS7y4jI1cgVrBK1B
+eKeJ1S47TQyVVG+RdmHdKGQmACVtum9oqAvh3WT8PMakW54a6Pza7bimmlzs2lHt
+cyvxtaVkPsOe9bcHQYNEx9VMj4pHPCa2w4i6puXBUHSTgWgTs0JhJiYYDVR5A5Ku
+6W+QnB/rcIPu72bQr5c7VPZ4aj0RshENGctZqA0jLyITKWmqCQTjRZS8ovC27ClP
+TgnewC9+kkf/amRTqYRGriNP7TrIug2p+9iPjklyPBFKrKbUBzBGmxqIfh2qVId0
+iF/sDWECgYEA5BicP5qtx/I9BkWNQwHsETFjaUwUR2BGPcRV51WcO/qmBhyu51jq
+dHNU0X1r/ppMpSdaBZPQTfmUs0xDpS+Uh2NGQdB39FMEY7LO7HvIM2dlkgv+Pj5r
+TEeg8bFACtgpiSdsIDPqsjsOCANszDbb7y36xEBtcGD7Z5GA3VVS3C8CgYEA09q2
+iFTtZSda6jWLFPzCwGRknjrUNbI05njajs2If0N4KCHiXqS63lDjAAthMlKCVICC
+GqWjG8EAmeyFC9FtLUmr1QY/ksRxFvz+dL9JBGriW/eZZlVITdEZukWz3+2v9pKv
+tXGhJLVPF5e5nzGO1/cssMzeoNCEv15b/UKuzuECgYBJHPZgkOUpVSVocDzigKg5
+rpoN83wAkQSS4e8jMtbchvBWvzT1JRQp9Zn3eHt4Zd8xhRae+Q1pIRogCs8YENNM
+Pm8Tw43fvAiJKJSZSugWSgtNsBhzvTBJiCA3uLgtgbJ2qzNGcz3EmZdazDZAk0kW
+NqfN5lTuE7giL4qd566iswKBgC3Hq34WbB5ZvMmzvFRSsnsEtsGCkOzxj4DmSMRn
+IcHugH6bo+Ez07XK4OLXkq9fKQ69nl/Hv1F2CX05oR6GqQMKUnl8GizLCm0fSpVL
+6Kltt3CMNrfoYfF+6AJaoZ4YLNgpppKc9WeLToYYoWIHQYjlvuCNxOYXaTg5WcOG
+r2PBAoGAZe5mh6Z6NaFFJ8ij+xIwN6izR2tBD2gLYh5+xXd4FRpwWaxPZLn7AHEi
+4ToSichsfptLkNLnmy2J4HZD+bhbnRsmyB+yael1ItudRhM0wBp4yV33pBY/Fiq8
+GyIBZfMLy9B1L+2HsYLxvX7bom7CNl3VFkNuuBspm8azyzWGC+w=
+-----END RSA PRIVATE KEY-----
+";
+    const TEST_N: &str = "vMMoYHJ6xbjxFgYUc986J2j-z3gLpGykggyx1Vj8T83SolqLU8iAXslPl5lorHTi3JAY7k3No5XGsiBT8Tayv7VeMxEcFtjJ3qIPdsebgq0V85MZXfM1o59MXl9CTBBkcGCY6hPXKTsgSdGsBTQds_ZXUtNZv5UM_2wGiNSDJRD4dRd3Ukg_PRRbtVMLl6lotcuUFVBb9JYUHbPP6pQO_266VoQsM9Vg0yfaL6QkzortJVfk3AaaV35_LrG-RZAkTMeNJ6iYqWQEguDlXqb94zefkf9y1hEz0XtxezXftGynRhZHYcPlUQU6MlET0zEcvPu4jZHsWW10bge5cPNXTw";
+    const ISS: &str = "https://idp.invalid/auth/";
+    const CLIENT: &str = "client";
+
+    fn jwks() -> JwkSet {
+        serde_json::from_value(serde_json::json!({"keys": [
+            {"kty": "RSA", "kid": "k1", "alg": "RS256", "use": "sig", "n": TEST_N, "e": "AQAB"}
+        ]}))
+        .unwrap()
+    }
+
+    fn claims() -> serde_json::Value {
+        let now = unix_time_seconds();
+        serde_json::json!({
+            "iss": ISS, "sub": "u1", "aud": CLIENT, "nonce": "n1",
+            "iat": now, "exp": now + 300,
+        })
+    }
+
+    fn mint(kid: &str, claims: &serde_json::Value) -> String {
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some(kid.into());
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_KEY.as_bytes()).unwrap();
+        jsonwebtoken::encode(&header, claims, &key).unwrap()
+    }
+
+    fn verify(token: &str) -> Result<IdClaims, String> {
+        verify_id_token(token, &jwks(), ISS, CLIENT, "n1", "at")
+    }
+
+    #[test]
+    fn valid_rs256_token_verifies() {
+        assert_eq!(verify(&mint("k1", &claims())).unwrap().sub, "u1");
+    }
+
+    #[test]
+    fn claim_checks_reject_bad_tokens() {
+        let now = unix_time_seconds();
+        let mutate = |key: &str, value: serde_json::Value| {
+            let mut c = claims();
+            c[key] = value;
+            mint("k1", &c)
+        };
+        assert!(verify(&mutate("iss", "https://evil.invalid/".into())).is_err());
+        assert!(verify(&mutate("aud", "other".into())).is_err());
+        assert!(verify(&mutate("nonce", "n2".into())).is_err());
+        assert!(verify(&mutate("exp", (now - 3600).into())).is_err());
+        assert!(verify(&mutate("nbf", (now + 3600).into())).is_err());
+        assert!(verify(&mutate("iat", (now + 3600).into())).is_err());
+        assert!(verify(&mutate("azp", "other".into())).is_err());
+        assert!(verify(&mutate("at_hash", "bad".into())).is_err());
+        assert!(verify(&mutate("aud", serde_json::json!([CLIENT, "x"]))).is_err());
+        let mut c = claims();
+        c["aud"] = serde_json::json!([CLIENT, "x"]);
+        c["azp"] = CLIENT.into();
+        assert!(verify(&mint("k1", &c)).is_ok());
+        let mut c = claims();
+        c.as_object_mut().unwrap().remove("nonce");
+        assert!(verify(&mint("k1", &c)).is_err());
+    }
+
+    #[test]
+    fn unknown_kid_and_bad_signature_are_rejected() {
+        assert!(verify(&mint("other", &claims())).is_err());
+        let token = mint("k1", &claims());
+        let (head, sig) = token.rsplit_once('.').unwrap();
+        let forged = format!("{head}.{}", sig.chars().rev().collect::<String>());
+        assert!(verify(&forged).is_err());
+    }
+
+    #[test]
+    fn none_and_hmac_algorithms_are_rejected() {
+        let b64 = |v: serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
+        let none = format!(
+            "{}.{}.",
+            b64(serde_json::json!({"alg": "none", "kid": "k1"})),
+            b64(claims())
+        );
+        assert!(verify(&none).is_err());
+        let mut header = jsonwebtoken::Header::new(Algorithm::HS256);
+        header.kid = Some("k1".into());
+        let hs = jsonwebtoken::encode(
+            &header,
+            &claims(),
+            &jsonwebtoken::EncodingKey::from_secret(TEST_N.as_bytes()),
+        )
+        .unwrap();
+        assert!(verify(&hs).unwrap_err().contains("not allowed"));
+    }
+
+    #[test]
+    fn authorization_url_carries_s256_pkce_state_and_nonce() {
+        let client = OidcClient {
+            metadata: ProviderMetadata {
+                issuer: ISS.into(),
+                authorization_endpoint: "https://idp.invalid/authorize".into(),
+                token_endpoint: String::new(),
+                jwks_uri: String::new(),
+                userinfo_endpoint: None,
+            },
+            http: reqwest::Client::new(),
+            config: OidcConfig {
+                issuer: ISS.into(),
+                client_id: CLIENT.into(),
+                redirect_uri: "https://app.invalid/cb".into(),
+                scopes: vec!["email".into()],
+            },
+        };
+        let request = client.authorization_request(None).unwrap();
+        let url = Url::parse(&request.url).unwrap();
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q["scope"], "openid email");
+        assert_eq!(q["state"], request.transaction.csrf_state);
+        assert_eq!(q["nonce"], request.transaction.nonce);
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert_eq!(
+            q["code_challenge"],
+            URL_SAFE_NO_PAD.encode(Sha256::digest(request.transaction.pkce_verifier.as_bytes()))
+        );
     }
 }
