@@ -68,7 +68,7 @@ jobs:
       - name: Check MSRV
         run: |
           set -eu
-          test "$(nix develop .#msrv -c rustc --version | cut -d ' ' -f 2)" = '1.85.0'
+          test "$(nix develop .#msrv -c rustc --version | cut -d ' ' -f 2)" = '1.88.0'
           nix develop .#msrv -c cargo check --all-targets --all-features
 
       - name: Build docs
