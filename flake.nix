@@ -46,7 +46,13 @@
         strictDeps = true;
       };
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-      uncachedPackage = craneLib.buildPackage (commonArgs // {inherit cargoArtifacts;});
+      uncachedPackage = craneLib.buildPackage (commonArgs
+        // {
+          inherit cargoArtifacts;
+          # reqwest's platform verifier panics in Client::new() without a CA
+          # store, which the build sandbox lacks.
+          preCheck = "export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+        });
       package = buildCache.withRustCache {
         package = uncachedPackage;
       };
