@@ -28,7 +28,10 @@
         overlays = [(import rust-overlay)];
       };
 
-      toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; toolchainProfile = "stable"; };
+      toolchain = rs-harbor.lib.mkToolchain {
+        inherit pkgs;
+        toolchainProfile = "stable";
+      };
       inherit (toolchain) craneLib rustToolchain;
       buildCache = rs-harbor.lib.mkBuildCachePolicy {
         inherit pkgs;
@@ -43,8 +46,15 @@
         strictDeps = true;
       };
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+      uncachedPackage = craneLib.buildPackage (commonArgs
+        // {
+          inherit cargoArtifacts;
+          # reqwest's platform verifier panics in Client::new() without a CA
+          # store, which the build sandbox lacks.
+          preCheck = "export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+        });
       package = buildCache.withRustCache {
-        package = craneLib.buildPackage (commonArgs // {inherit cargoArtifacts;});
+        package = uncachedPackage;
       };
       treefmtEval = treefmt-nix.lib.evalModule pkgs (import ./nix/treefmt.nix);
       pre-commit-check = git-hooks.lib.${system}.run {
@@ -57,9 +67,11 @@
       };
     in {
       packages.default = package;
+      packages.uncached = uncachedPackage;
       formatter = treefmtEval.config.build.wrapper;
       checks = {
-        default = package;
+        # CI validates the same package without depending on a host cache mount.
+        default = uncachedPackage;
         formatting = treefmtEval.config.build.check self;
         clippy = craneLib.cargoClippy (commonArgs
           // {
@@ -68,6 +80,14 @@
           });
         fmt = craneLib.cargoFmt {inherit src;};
       };
+      devShells.msrv = pkgs.mkShell {
+        inputsFrom = [(self.devShells.${system}.default.overrideAttrs (_: {shellHook = "";}))];
+        packages = [pkgs.rust-bin.stable."1.88.0".minimal];
+        RUSTFLAGS = "";
+        CARGO_ENCODED_RUSTFLAGS = "";
+        RUSTC_WRAPPER = "";
+      };
+      devShells.docs = self.devShells.${system}.default;
       devShells.default = craneLib.devShell {
         checks = self.checks.${system};
         packages = with pkgs;
