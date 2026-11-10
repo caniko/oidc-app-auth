@@ -25,8 +25,9 @@ would take over their route and persistence models, which differ.
 - **Short-lived browser state is signed.** `SignedFlowState` carries the flow
   through the redirect; sessions are opaque tokens rather than self-describing
   bearer data.
-- **Release discipline.** Forgejo workflows run formatting, strict Clippy, tests,
-  docs, audit, and package listing, and publication is a separate step.
+- **Release discipline.** The repository's Crow CI pipelines run formatting,
+  strict Clippy, tests, docs, audit, and package listing, and publication is a
+  separate step.
 - **Immutable consumer pins until publication.** Consumers pin a reviewed commit
   because the first crates.io release is pending.
 
