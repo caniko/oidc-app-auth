@@ -7,7 +7,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
 use rand::{RngCore, rngs::OsRng};
-use reqwest::Url;
+use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -116,6 +116,63 @@ pub struct VerifiedIdentity {
     pub expires_at: Option<u64>,
 }
 
+/// Tokens returned by a successful login or refresh.
+///
+/// Token values are redacted from [`Debug`] output so they cannot leak through
+/// logs. Applications own persistence and decide when to refresh.
+pub struct TokenSet {
+    /// The bearer access token used with provider APIs such as userinfo.
+    pub access_token: String,
+    /// The refresh token, when the provider issued one.
+    pub refresh_token: Option<String>,
+    /// The raw ID token, when the provider issued one.
+    pub id_token: Option<String>,
+    /// The access-token expiry as a Unix timestamp, computed from
+    /// `expires_in` when the provider sent it.
+    pub access_expires_at: Option<u64>,
+}
+
+impl std::fmt::Debug for TokenSet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TokenSet")
+            .field("access_token", &"REDACTED")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "REDACTED"),
+            )
+            .field("id_token", &self.id_token.as_ref().map(|_| "REDACTED"))
+            .field("access_expires_at", &self.access_expires_at)
+            .finish()
+    }
+}
+
+/// Userinfo claims for a live access token.
+#[derive(Clone, Debug)]
+pub struct UserInfoClaims {
+    /// The provider-stable subject identifier.
+    pub subject: String,
+    /// A normalized lower-case email address, when supplied by the provider.
+    pub email: Option<String>,
+    /// A display name, when supplied by the provider.
+    pub display_name: Option<String>,
+    /// Group claims supplied by the provider.
+    pub groups: BTreeSet<String>,
+}
+
+/// Why a userinfo revalidation did not produce claims.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum UserInfoError {
+    /// The provider rejected the token, or the response was not userinfo for
+    /// the expected subject: the identity is no longer valid.
+    #[error("userinfo request was rejected")]
+    Rejected,
+    /// The provider could not answer: connection, timeout, HTTP 5xx, or no
+    /// advertised endpoint. Retrying later is reasonable.
+    #[error("userinfo endpoint is unavailable")]
+    Unavailable,
+}
+
 /// The authorization URL and state that must be retained for its callback.
 #[derive(Clone, Debug)]
 pub struct AuthorizationRequest {
@@ -133,12 +190,29 @@ struct ProviderMetadata {
     token_endpoint: String,
     jwks_uri: String,
     userinfo_endpoint: Option<String>,
+    end_session_endpoint: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
+    refresh_token: Option<String>,
     id_token: Option<String>,
+    expires_in: Option<u64>,
+}
+
+impl TokenResponse {
+    /// Convert to a [`TokenSet`], turning the relative lifetime into an
+    /// absolute expiry at receipt time.
+    fn into_token_set(self) -> TokenSet {
+        let now = unix_time_seconds();
+        TokenSet {
+            access_token: self.access_token,
+            refresh_token: self.refresh_token,
+            id_token: self.id_token,
+            access_expires_at: self.expires_in.map(|seconds| now.saturating_add(seconds)),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,6 +351,7 @@ impl OidcClient {
     /// Validate a callback, exchange its code with PKCE, and return verified
     /// identity claims.
     ///
+    /// Tokens are discarded; use [`Self::complete_with_tokens`] to retain them.
     /// The transaction is single-use from the caller's perspective: callers
     /// should remove it from their session store after attempting completion.
     /// Errors cover expiry, callback/state mismatches, exchange failures, and
@@ -287,6 +362,22 @@ impl OidcClient {
         callback: Callback,
         transaction: LoginTransaction,
     ) -> Result<VerifiedIdentity, AuthError> {
+        self.complete_with_tokens(callback, transaction)
+            .await
+            .map(|(identity, _tokens)| identity)
+    }
+
+    /// Validate a callback, exchange its code with PKCE, and return verified
+    /// identity claims together with the provider's tokens.
+    ///
+    /// Retained tokens are bearer credentials; applications own their storage,
+    /// cookie handling, and access policy. The transaction is single-use from
+    /// the caller's perspective.
+    pub async fn complete_with_tokens(
+        &self,
+        callback: Callback,
+        transaction: LoginTransaction,
+    ) -> Result<(VerifiedIdentity, TokenSet), AuthError> {
         if transaction.is_expired_at(unix_time_seconds()) {
             return Err(AuthError::ExpiredTransaction);
         }
@@ -315,44 +406,159 @@ impl OidcClient {
             ]))
             .await
             .map_err(AuthError::Exchange)?;
+        let tokens = tokens.into_token_set();
         let id_token = tokens
             .id_token
+            .as_deref()
             .ok_or_else(|| AuthError::Identity("provider returned no ID token".into()))?;
-        let jwks: JwkSet = get_json(self.http.get(&self.metadata.jwks_uri))
+        let claims = self
+            .verify_token(id_token, &tokens.access_token, Some(&transaction.nonce))
+            .await?;
+        let userinfo = self
+            .userinfo(&tokens.access_token, &claims.sub)
             .await
-            .map_err(|error| AuthError::Identity(format!("JWKS: {error}")))?;
-        let claims = verify_id_token(
-            &id_token,
-            &jwks,
-            &self.config.issuer,
-            &self.config.client_id,
-            &transaction.nonce,
-            &tokens.access_token,
-        )
-        .map_err(|error| AuthError::Identity(format!("ID token validation: {error}")))?;
+            .map_err(|error| AuthError::Identity(format!("userinfo validation: {error}")))?;
+        Ok((
+            VerifiedIdentity {
+                issuer: self.config.issuer.clone(),
+                subject: claims.sub,
+                email: userinfo.email,
+                display_name: userinfo.display_name,
+                groups: userinfo.groups,
+                expires_at: Some(claims.exp),
+            },
+            tokens,
+        ))
+    }
 
+    /// Exchange a refresh token for a new token set.
+    ///
+    /// Uses the refresh-token grant for this public client (no secret) and
+    /// validates a returned ID token like a login ID token, except that no
+    /// nonce is expected, and requires its subject to equal
+    /// `expected_subject`. When the provider returns no ID token the subject
+    /// cannot be checked here: callers must confirm the new access token with
+    /// [`Self::userinfo`] for the same subject before installing it. The
+    /// provider decides whether a refresh is accepted; Rauthy accepts its
+    /// refresh tokens starting at access-token expiry minus 60 seconds, so
+    /// callers schedule the call from [`TokenSet::access_expires_at`]. A
+    /// missing `refresh_token` in the response is returned as-is; keeping the
+    /// old value is the caller's job.
+    pub async fn refresh(
+        &self,
+        refresh_token: &str,
+        expected_subject: &str,
+    ) -> Result<TokenSet, AuthError> {
+        let tokens: TokenResponse =
+            get_json(self.http.post(&self.metadata.token_endpoint).form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", self.config.client_id.as_str()),
+            ]))
+            .await
+            .map_err(AuthError::Exchange)?;
+        let tokens = tokens.into_token_set();
+        if let Some(id_token) = tokens.id_token.as_deref() {
+            let claims = self
+                .verify_token(id_token, &tokens.access_token, None)
+                .await?;
+            if claims.sub != expected_subject {
+                return Err(AuthError::Identity(
+                    "refreshed ID token: subject mismatch".into(),
+                ));
+            }
+        }
+        Ok(tokens)
+    }
+
+    /// Revalidate a live access token against the provider's userinfo endpoint.
+    ///
+    /// [`UserInfoError::Rejected`] means the token or identity is no longer
+    /// valid (HTTP 400/401/403/404, a subject mismatch, or a response that is
+    /// not a JSON userinfo object); the caller should end the session.
+    /// [`UserInfoError::Unavailable`] means the provider could not answer
+    /// (connection, timeout, HTTP 5xx, or no advertised endpoint); retrying
+    /// later is reasonable.
+    pub async fn userinfo(
+        &self,
+        access_token: &str,
+        expected_subject: &str,
+    ) -> Result<UserInfoClaims, UserInfoError> {
         let endpoint = self
             .metadata
             .userinfo_endpoint
-            .as_ref()
-            .ok_or_else(|| AuthError::Identity("userinfo endpoint: not advertised".into()))?;
-        let userinfo: UserInfo =
-            get_json(self.http.get(endpoint).bearer_auth(&tokens.access_token))
-                .await
-                .map_err(|error| AuthError::Identity(format!("userinfo validation: {error}")))?;
-        if userinfo.sub != claims.sub {
-            return Err(AuthError::Identity(
-                "userinfo validation: subject mismatch".into(),
-            ));
+            .as_deref()
+            .ok_or(UserInfoError::Unavailable)?;
+        let response = self
+            .http
+            .get(endpoint)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| UserInfoError::Unavailable)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(classify_userinfo_status(status));
         }
-        Ok(VerifiedIdentity {
-            issuer: self.config.issuer.clone(),
-            subject: claims.sub,
-            email: userinfo.email.map(|email| email.to_ascii_lowercase()),
-            display_name: userinfo.name,
-            groups: userinfo.groups.into_iter().collect(),
-            expires_at: Some(claims.exp),
-        })
+        let is_json = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_json_content_type);
+        // A body that fails to arrive is an outage; one that arrives but is
+        // not userinfo JSON is a rejection.
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| UserInfoError::Unavailable)?;
+        if !is_json {
+            return Err(UserInfoError::Rejected);
+        }
+        userinfo_claims(parse_userinfo(&body)?, expected_subject)
+    }
+
+    /// Build the provider's RP-initiated logout URL.
+    ///
+    /// Returns `None` when discovery did not advertise an
+    /// `end_session_endpoint`. `post_logout_redirect_uri` must already be
+    /// registered with the provider; all parameters are query-encoded.
+    pub fn end_session_url(
+        &self,
+        id_token_hint: Option<&str>,
+        post_logout_redirect_uri: &str,
+    ) -> Option<String> {
+        let mut url = Url::parse(self.metadata.end_session_endpoint.as_deref()?).ok()?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("client_id", &self.config.client_id);
+            query.append_pair("post_logout_redirect_uri", post_logout_redirect_uri);
+            if let Some(id_token_hint) = id_token_hint {
+                query.append_pair("id_token_hint", id_token_hint);
+            }
+        }
+        Some(url.to_string())
+    }
+
+    /// Fetch the key set and verify an ID token for this client; `nonce` is
+    /// checked only when supplied (refresh responses carry none).
+    async fn verify_token(
+        &self,
+        id_token: &str,
+        access_token: &str,
+        nonce: Option<&str>,
+    ) -> Result<IdClaims, AuthError> {
+        let jwks: JwkSet = get_json(self.http.get(&self.metadata.jwks_uri))
+            .await
+            .map_err(|error| AuthError::Identity(format!("JWKS: {error}")))?;
+        verify_id_token(
+            id_token,
+            &jwks,
+            &self.config.issuer,
+            &self.config.client_id,
+            nonce,
+            access_token,
+        )
+        .map_err(|error| AuthError::Identity(format!("ID token validation: {error}")))
     }
 }
 
@@ -368,6 +574,55 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     response.json().await.map_err(|error| error.to_string())
 }
 
+/// Classify a non-success userinfo HTTP status.
+///
+/// 400/401/403/404 answer for the credential itself (Rauthy uses 400 for a
+/// malformed token and 404 for an unknown signing key); every other
+/// non-success status, including throttling and 5xx, is the provider failing
+/// to answer.
+fn classify_userinfo_status(status: StatusCode) -> UserInfoError {
+    match status.as_u16() {
+        400 | 401 | 403 | 404 => UserInfoError::Rejected,
+        _ => UserInfoError::Unavailable,
+    }
+}
+
+/// Userinfo must be served as JSON; a signed (`application/jwt`) response is
+/// not supported and is rejected rather than parsed.
+fn is_json_content_type(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// Parse a userinfo body that must be a JSON object; serde would otherwise
+/// accept a positional array for the struct.
+fn parse_userinfo(body: &[u8]) -> Result<UserInfo, UserInfoError> {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(value @ serde_json::Value::Object(_)) => {
+            serde_json::from_value(value).map_err(|_| UserInfoError::Rejected)
+        }
+        _ => Err(UserInfoError::Rejected),
+    }
+}
+
+/// Normalize parsed userinfo and require the expected subject.
+fn userinfo_claims(
+    userinfo: UserInfo,
+    expected_subject: &str,
+) -> Result<UserInfoClaims, UserInfoError> {
+    if userinfo.sub != expected_subject {
+        return Err(UserInfoError::Rejected);
+    }
+    Ok(UserInfoClaims {
+        subject: userinfo.sub,
+        email: userinfo.email.map(|email| email.to_ascii_lowercase()),
+        display_name: userinfo.name,
+        groups: userinfo.groups.into_iter().collect(),
+    })
+}
+
 /// 256 random bits, base64url-encoded: PKCE verifier, state and nonce.
 fn random_token() -> String {
     let mut bytes = [0_u8; 32];
@@ -377,13 +632,13 @@ fn random_token() -> String {
 
 /// Verify an ID token's signature (against `jwks`, selected by `kid`) and
 /// claims: allowed algorithm, `iss`, `aud`, `azp`, `exp`, `nbf`, `iat`,
-/// `nonce`, and `at_hash` when present.
+/// `nonce` (only when supplied), and `at_hash` when present.
 fn verify_id_token(
     token: &str,
     jwks: &JwkSet,
     issuer: &str,
     client_id: &str,
-    nonce: &str,
+    nonce: Option<&str>,
     access_token: &str,
 ) -> Result<IdClaims, String> {
     let header = jsonwebtoken::decode_header(token).map_err(|error| error.to_string())?;
@@ -407,7 +662,8 @@ fn verify_id_token(
         .map_err(|error| error.to_string())?
         .claims;
 
-    if claims.nonce.as_deref() != Some(nonce) {
+    // Refresh responses carry no nonce; login flows always supply one.
+    if nonce.is_some_and(|nonce| claims.nonce.as_deref() != Some(nonce)) {
         return Err("nonce mismatch".into());
     }
     let multiple = matches!(&claims.aud, Audience::Many(audiences) if audiences.len() > 1);
@@ -635,8 +891,28 @@ GyIBZfMLy9B1L+2HsYLxvX7bom7CNl3VFkNuuBspm8azyzWGC+w=
         jsonwebtoken::encode(&header, claims, &key).unwrap()
     }
 
+    fn client(end_session_endpoint: Option<&str>) -> OidcClient {
+        OidcClient {
+            metadata: ProviderMetadata {
+                issuer: ISS.into(),
+                authorization_endpoint: "https://idp.invalid/authorize".into(),
+                token_endpoint: String::new(),
+                jwks_uri: String::new(),
+                userinfo_endpoint: None,
+                end_session_endpoint: end_session_endpoint.map(str::to_string),
+            },
+            http: reqwest::Client::new(),
+            config: OidcConfig {
+                issuer: ISS.into(),
+                client_id: CLIENT.into(),
+                redirect_uri: "https://app.invalid/cb".into(),
+                scopes: vec!["email".into()],
+            },
+        }
+    }
+
     fn verify(token: &str) -> Result<IdClaims, String> {
-        verify_id_token(token, &jwks(), ISS, CLIENT, "n1", "at")
+        verify_id_token(token, &jwks(), ISS, CLIENT, Some("n1"), "at")
     }
 
     #[test]
@@ -701,22 +977,7 @@ GyIBZfMLy9B1L+2HsYLxvX7bom7CNl3VFkNuuBspm8azyzWGC+w=
 
     #[test]
     fn authorization_url_carries_s256_pkce_state_and_nonce() {
-        let client = OidcClient {
-            metadata: ProviderMetadata {
-                issuer: ISS.into(),
-                authorization_endpoint: "https://idp.invalid/authorize".into(),
-                token_endpoint: String::new(),
-                jwks_uri: String::new(),
-                userinfo_endpoint: None,
-            },
-            http: reqwest::Client::new(),
-            config: OidcConfig {
-                issuer: ISS.into(),
-                client_id: CLIENT.into(),
-                redirect_uri: "https://app.invalid/cb".into(),
-                scopes: vec!["email".into()],
-            },
-        };
+        let client = client(None);
         let request = client.authorization_request(None).unwrap();
         let url = Url::parse(&request.url).unwrap();
         let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
@@ -728,5 +989,145 @@ GyIBZfMLy9B1L+2HsYLxvX7bom7CNl3VFkNuuBspm8azyzWGC+w=
             q["code_challenge"],
             URL_SAFE_NO_PAD.encode(Sha256::digest(request.transaction.pkce_verifier.as_bytes()))
         );
+    }
+
+    #[test]
+    fn token_set_debug_redacts_token_values() {
+        let tokens = TokenSet {
+            access_token: "access-secret".into(),
+            refresh_token: Some("refresh-secret".into()),
+            id_token: Some("id-secret".into()),
+            access_expires_at: Some(1_700_000_000),
+        };
+        let debug = format!("{tokens:?}");
+        assert!(!debug.contains("secret"));
+        assert_eq!(debug.matches("REDACTED").count(), 3);
+        assert!(debug.contains("1700000000"));
+    }
+
+    #[test]
+    fn token_responses_parse_optional_fields() {
+        let before = unix_time_seconds();
+        let full = serde_json::from_str::<TokenResponse>(
+            r#"{"access_token":"at","refresh_token":"rt","id_token":"it","expires_in":300}"#,
+        )
+        .unwrap()
+        .into_token_set();
+        assert_eq!(full.access_token, "at");
+        assert_eq!(full.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(full.id_token.as_deref(), Some("it"));
+        let expires_at = full.access_expires_at.unwrap();
+        assert!((before + 300..=unix_time_seconds() + 300).contains(&expires_at));
+
+        let minimal = serde_json::from_str::<TokenResponse>(r#"{"access_token":"at"}"#)
+            .unwrap()
+            .into_token_set();
+        assert!(minimal.refresh_token.is_none());
+        assert!(minimal.id_token.is_none());
+        assert!(minimal.access_expires_at.is_none());
+    }
+
+    #[test]
+    fn end_session_url_encodes_parameters_and_requires_an_endpoint() {
+        assert!(
+            client(None)
+                .end_session_url(None, "https://app.invalid/")
+                .is_none()
+        );
+
+        let redirect = "https://app.invalid/done?next=/a b&x=1";
+        let url = client(Some("https://idp.invalid/logout"))
+            .end_session_url(Some("header.payload.signature"), redirect)
+            .unwrap();
+        let url = Url::parse(&url).unwrap();
+        assert_eq!(url.origin().ascii_serialization(), "https://idp.invalid");
+        assert_eq!(url.path(), "/logout");
+        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(query["client_id"], CLIENT);
+        assert_eq!(query["post_logout_redirect_uri"], redirect);
+        assert_eq!(query["id_token_hint"], "header.payload.signature");
+
+        let url = client(Some("https://idp.invalid/logout"))
+            .end_session_url(None, redirect)
+            .unwrap();
+        let query: std::collections::HashMap<_, _> = Url::parse(&url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert!(!query.contains_key("id_token_hint"));
+    }
+
+    #[test]
+    fn userinfo_bodies_must_be_json_objects() {
+        assert!(is_json_content_type("application/json"));
+        assert!(is_json_content_type("application/json; charset=utf-8"));
+        assert!(!is_json_content_type("application/jwt"));
+        assert!(!is_json_content_type("text/html"));
+        assert_eq!(
+            parse_userinfo(br#"["u1",null,null,[]]"#).err(),
+            Some(UserInfoError::Rejected)
+        );
+        assert_eq!(
+            parse_userinfo(b"<html>bad gateway</html>").err(),
+            Some(UserInfoError::Rejected)
+        );
+        assert_eq!(
+            parse_userinfo(br#"{"sub":"u1","groups":["g"]}"#)
+                .map(|userinfo| userinfo.sub)
+                .ok(),
+            Some("u1".to_owned())
+        );
+    }
+
+    #[test]
+    fn userinfo_statuses_classify_rejection_versus_unavailability() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert_eq!(classify_userinfo_status(status), UserInfoError::Rejected);
+        }
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert_eq!(classify_userinfo_status(status), UserInfoError::Unavailable);
+        }
+    }
+
+    #[test]
+    fn userinfo_requires_the_expected_subject() {
+        let parse = |value: serde_json::Value| serde_json::from_value::<UserInfo>(value).unwrap();
+        assert_eq!(
+            userinfo_claims(parse(serde_json::json!({"sub": "u2"})), "u1").unwrap_err(),
+            UserInfoError::Rejected
+        );
+        let claimed = parse(serde_json::json!({
+            "sub": "u1",
+            "email": "User@Example.INVALID",
+            "name": "User",
+            "groups": ["a", "a", "b"],
+        }));
+        let claims = userinfo_claims(claimed, "u1").unwrap();
+        assert_eq!(claims.subject, "u1");
+        assert_eq!(claims.email.as_deref(), Some("user@example.invalid"));
+        assert_eq!(claims.display_name.as_deref(), Some("User"));
+        assert_eq!(claims.groups.into_iter().collect::<Vec<_>>(), ["a", "b"]);
+    }
+
+    #[test]
+    fn refresh_id_tokens_skip_nonce_but_keep_other_checks() {
+        let token = mint("k1", &claims());
+        assert!(verify_id_token(&token, &jwks(), ISS, CLIENT, None, "at").is_ok());
+        assert!(verify_id_token(&token, &jwks(), ISS, CLIENT, Some("n2"), "at").is_err());
+        let mut wrong_audience = claims();
+        wrong_audience["aud"] = "other".into();
+        let bad_token = mint("k1", &wrong_audience);
+        assert!(verify_id_token(&bad_token, &jwks(), ISS, CLIENT, None, "at").is_err());
     }
 }

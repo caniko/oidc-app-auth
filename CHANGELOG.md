@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Provider-neutral OIDC PKCE and opaque browser-session primitives.
+- Session lifecycle additions: `TokenSet` (redacted `Debug`) returned by
+  `OidcClient::complete_with_tokens`, `OidcClient::refresh` for the
+  refresh-token grant, `OidcClient::userinfo` with `UserInfoClaims` and
+  `UserInfoError` for revalidation, and `OidcClient::end_session_url` for
+  RP-initiated logout.
 
 ### Changed
 
