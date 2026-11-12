@@ -471,13 +471,16 @@ impl OidcClient {
         if !status.is_success() {
             return Err(classify_userinfo_status(status));
         }
+        let is_json = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_json_content_type);
         let body = response
             .bytes()
             .await
             .map_err(|_| UserInfoError::Unavailable)?;
-        let tokens = serde_json::from_slice::<TokenResponse>(&body)
-            .map_err(|_| UserInfoError::Rejected)?
-            .into_token_set();
+        let tokens = parse_token_response(is_json, &body)?.into_token_set();
         if let Some(id_token) = tokens.id_token.as_deref() {
             let jwks: JwkSet = get_json(self.http.get(&self.metadata.jwks_uri))
                 .await
@@ -621,6 +624,16 @@ fn is_json_content_type(value: &str) -> bool {
         .split(';')
         .next()
         .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// A successful token response that is not JSON (e.g. a proxy's HTML error
+/// page) means the provider did not answer; JSON that is not a token response
+/// means it answered wrongly.
+fn parse_token_response(is_json: bool, body: &[u8]) -> Result<TokenResponse, UserInfoError> {
+    if !is_json {
+        return Err(UserInfoError::Unavailable);
+    }
+    serde_json::from_slice(body).map_err(|_| UserInfoError::Rejected)
 }
 
 /// Parse a userinfo body that must be a JSON object; serde would otherwise
@@ -1083,6 +1096,19 @@ GyIBZfMLy9B1L+2HsYLxvX7bom7CNl3VFkNuuBspm8azyzWGC+w=
             .into_owned()
             .collect();
         assert!(!query.contains_key("id_token_hint"));
+    }
+
+    #[test]
+    fn refresh_responses_split_outages_from_bad_answers() {
+        assert_eq!(
+            parse_token_response(false, b"<html>bad gateway</html>").err(),
+            Some(UserInfoError::Unavailable)
+        );
+        assert_eq!(
+            parse_token_response(true, br#"{"error":"nope"}"#).err(),
+            Some(UserInfoError::Rejected)
+        );
+        assert!(parse_token_response(true, br#"{"access_token":"a"}"#).is_ok());
     }
 
     #[test]
