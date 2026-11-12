@@ -160,7 +160,8 @@ pub struct UserInfoClaims {
     pub groups: BTreeSet<String>,
 }
 
-/// Why a userinfo revalidation did not produce claims.
+/// Why a provider revalidation ([`OidcClient::userinfo`] or
+/// [`OidcClient::refresh`]) failed.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum UserInfoError {
     /// The provider rejected the token, or the response was not userinfo for
@@ -444,28 +445,54 @@ impl OidcClient {
     /// callers schedule the call from [`TokenSet::access_expires_at`]. A
     /// missing `refresh_token` in the response is returned as-is; keeping the
     /// old value is the caller's job.
+    ///
+    /// Errors split like [`Self::userinfo`]: [`UserInfoError::Rejected`] for a
+    /// refused grant (HTTP 400/401/403/404, e.g. `invalid_grant`), a malformed
+    /// token response, or an ID token that fails validation or names another
+    /// subject; [`UserInfoError::Unavailable`] when the token or key endpoint
+    /// could not answer.
     pub async fn refresh(
         &self,
         refresh_token: &str,
         expected_subject: &str,
-    ) -> Result<TokenSet, AuthError> {
-        let tokens: TokenResponse =
-            get_json(self.http.post(&self.metadata.token_endpoint).form(&[
+    ) -> Result<TokenSet, UserInfoError> {
+        let response = self
+            .http
+            .post(&self.metadata.token_endpoint)
+            .form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token),
                 ("client_id", self.config.client_id.as_str()),
-            ]))
+            ])
+            .send()
             .await
-            .map_err(AuthError::Exchange)?;
-        let tokens = tokens.into_token_set();
+            .map_err(|_| UserInfoError::Unavailable)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(classify_userinfo_status(status));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| UserInfoError::Unavailable)?;
+        let tokens = serde_json::from_slice::<TokenResponse>(&body)
+            .map_err(|_| UserInfoError::Rejected)?
+            .into_token_set();
         if let Some(id_token) = tokens.id_token.as_deref() {
-            let claims = self
-                .verify_token(id_token, &tokens.access_token, None)
-                .await?;
+            let jwks: JwkSet = get_json(self.http.get(&self.metadata.jwks_uri))
+                .await
+                .map_err(|_| UserInfoError::Unavailable)?;
+            let claims = verify_id_token(
+                id_token,
+                &jwks,
+                &self.config.issuer,
+                &self.config.client_id,
+                None,
+                &tokens.access_token,
+            )
+            .map_err(|_| UserInfoError::Rejected)?;
             if claims.sub != expected_subject {
-                return Err(AuthError::Identity(
-                    "refreshed ID token: subject mismatch".into(),
-                ));
+                return Err(UserInfoError::Rejected);
             }
         }
         Ok(tokens)

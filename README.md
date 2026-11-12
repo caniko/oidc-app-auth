@@ -46,7 +46,8 @@ responsible for persistence, cookies, access policy, and secret storage.
   confirm the new access token with `userinfo` first). The caller decides when
   to call it (Rauthy accepts a refresh token starting at access-token expiry
   minus 60 seconds) and keeps the old refresh token when the response omits a
-  new one.
+  new one. Failures use the same `UserInfoError::{Rejected, Unavailable}`
+  split as `userinfo`.
 - `OidcClient::userinfo` revalidates a live access token against userinfo,
   distinguishing `UserInfoError::Rejected` from `UserInfoError::Unavailable`.
 - `OidcClient::end_session_url` builds the provider's RP-initiated logout URL
