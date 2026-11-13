@@ -37,6 +37,22 @@ authorization-code flow, `SignedFlowState` for short-lived signed browser
 state, and `SessionToken` for opaque session identifiers. Applications remain
 responsible for persistence, cookies, access policy, and secret storage.
 
+## Session lifecycle
+
+- `OidcClient::complete_with_tokens` returns the verified identity and the
+  provider tokens as a `TokenSet` whose `Debug` output redacts token values.
+- `OidcClient::refresh` performs the refresh-token grant for the public client
+  and requires a returned ID token to carry the session subject (without one,
+  confirm the new access token with `userinfo` first). The caller decides when
+  to call it (Rauthy accepts a refresh token starting at access-token expiry
+  minus 60 seconds) and keeps the old refresh token when the response omits a
+  new one. Failures use the same `UserInfoError::{Rejected, Unavailable}`
+  split as `userinfo`.
+- `OidcClient::userinfo` revalidates a live access token against userinfo,
+  distinguishing `UserInfoError::Rejected` from `UserInfoError::Unavailable`.
+- `OidcClient::end_session_url` builds the provider's RP-initiated logout URL
+  when discovery advertised an `end_session_endpoint`.
+
 The generated API documentation is published at
 [docs.rs/oidc-app-auth](https://docs.rs/oidc-app-auth).
 
